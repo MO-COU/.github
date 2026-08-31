@@ -1,170 +1,259 @@
-# MO-COU
 
-대규모 트래픽 환경에서 **초과 발급 0건 · 1인 1매 · 정합성**을 보장하는 선착순 쿠폰 발급 시스템.
+# 🎟️ MOCOU
 
-## 저장소 구성
+> 대규모 동시 요청 환경에서 초과 발급을 방지하고, 1인 1매와 Redis-DB 간 데이터 정합성을 보장하는 선착순 쿠폰 발급 시스템
 
-| 저장소 | 역할 |
-|---|---|
-| [`backend`](https://github.com/MO-COU/backend) | 실제 서비스 코드. `main`은 배포용, `dev`는 개발용 |
-| [`frontend`](https://github.com/MO-COU/fronted) | 관리자 대시보드를 보여주는 프론트앤드 |
-| [`load-test`](https://github.com/MO-COU/load-test) | 동시성 제어 방식 선정용 실험 저장소 |
-
-
-## 팀 구성
-
-| 팀 | 담당 영역 |
-|---|---|
-| A | 발급·트래픽 제어 (Redis 재고, 1인 1매, 대기열, 발급 실패 처리) |
-| B | 쿠폰 생명주기·정합성 (상태 전이, 만료 배치, 정합성 검증) |
-| C | 관리자·관측·테스트 (대시보드, Mock 알림, 부하 테스트, CI/CD) |
+MOCOU는 단순한 쿠폰 CRUD 구현을 넘어 **동시성 제어 · 비동기 처리 · 장애 복구 · 데이터 정합성 · 부하 테스트 · 운영**
+까지 검증한 프로젝트입니다.
 
 ---
 
-## 아키텍처 선정 — `load-test`의 실측 근거
+## 📦 Repositories
 
-선착순 발급의 핵심은 "동시 요청이 몰릴 때 정합성을 어떻게 지키는가"다. 이걸 실 서비스 배포 파이프라인 위에서 이것저것 실험하면 위험하고 느리다. 그래서 별도 저장소에서 테스트를 진행했다.
+| Repository | 설명 |
+|---|---|
+| [backend](https://github.com/MO-COU/backend) | Redis Lua 기반 선착순 발급, Redis Stream 비동기 처리, 정합성 검증, 쿠폰 생명주기, 관리자 및 운영 기능 |
+| [frontend](https://github.com/MO-COU/frontend) | 관리자 대시보드 및 운영·테스트 결과 조회 UI |
+| [load-test](https://github.com/MO-COU/load-test) | 6가지 동시성 제어 전략 비교 및 Redis Lua 선정 실험 |
 
-- 같은 요구사항을 **6가지 동시성 제어 방식**(대기·재시도·원자적 처리 × DB·Redis)으로 각각 구현하고
-- 동일한 부하 조건(재고 10,000 / 회원 20,000명 / VU 20,000, 60초 ramp-up)에서 정합성 → 성능 순으로 실측 비교한 뒤
-- 그 결과를 근거로 `backend`에 반영할 방식을 결정했다.
+---
+
+## 🎯 Project Goals
+
+선착순 쿠폰 발급 환경에서 다음 문제를 해결하는 것을 목표로 했습니다.
+
+- 쿠폰 재고 이상의 초과 발급 방지
+- 동일 회원의 중복 발급 방지
+- 높은 동시 요청 환경에서 DB 경합 최소화
+- Redis 예약과 MySQL 최종 데이터 간 정합성 보장
+- 비동기 DB 저장 과정에서 발생하는 장애 복구
+- 실제 부하 테스트를 통한 기술 선택 및 시스템 검증
+- 운영 환경에서의 로그 보존과 장애 분석
+
+---
+
+## 🏗 System Architecture
+
+<!-- 시스템 아키텍처 이미지 삽입 -->
+<!-- 예시:
+<img src="이미지_URL" width="100%" alt="MOCOU System Architecture">
+-->
+<img src="https://github.com/user-attachments/assets/2992ba1d-bad5-4e39-ab93-ede97f1bddca" width="100%" alt="MOCOU 시스템 아키텍처">
+
+MOCOU는 Redis Lua를 이용해 쿠폰 발급 가능 여부, 중복 발급, 재고 차감을 원자적으로 처리하고, Redis Stream을 통해 MySQL 저장을 비동기로 수행합니다.
+
+Consumer 처리 실패 시 PEL과 재시도, DLQ를 통해 장애 이벤트를 관리하며, 최종적으로 Redis와 MySQL 데이터를 교차 검증하여 정합성을 확인합니다.
+
+👉 [Backend Repository](https://github.com/MO-COU/backend)
+
+👉 [상세 아키텍처 문서](https://github.com/MO-COU/backend/blob/main/docs/architecture.md)
+
+---
+
+## 🔬 Architecture Decision
+
+최종 발급 방식을 처음부터 Redis Lua로 결정하지 않고, 동일한 조건에서 6가지 동시성 제어 전략을 직접 구현하고 비교했습니다.
 
 | 전략 | DB | Redis |
 |---|---|---|
-| **대기** — 락을 걸고 시작 | `pessimistic-lock` | `redisson-rlock` |
-| **재시도** — 충돌하면 다시 | `optimistic` | `redis-watch` |
-| **원자적** — 한 번에 처리 | `atomic-update` | `redis-lua` |
+| 대기 | Pessimistic Lock | Redisson RLock |
+| 재시도 | Optimistic Lock | Redis WATCH |
+| 원자적 처리 | Atomic UPDATE | Redis Lua |
 
-정합성(초과 발급 0건, 중복 발급 0건)을 통과한 방식만 성능 비교 대상에 올렸고, 처리량(`issued`/60초)·커넥션 풀 고갈·워커 스레드 포화 지표를 비교했다.
+실험 결과 단순히 Redis를 사용하는 것보다 **재고 판정 자체를 DB에서 Redis로 이동하는 것이 병목 개선의 핵심**임을 확인했습니다.
 
-**→ `redis-lua` 채택 완료.** 상세 비교 방법과 결과는 [`load-test`](https://github.com/MO-COU/load-test) 저장소 참고.
+이에 따라 최종 시스템의 동시성 제어 방식으로 **Redis Lua 기반 원자적 발급 구조**를 채택했습니다.
 
-### 왜 원자적 Redis 처리인가
-
-- 대기(락) 계열은 커넥션 풀과 워커 스레드가 락 대기로 고갈되기 쉽다.
-- 재시도 계열은 충돌이 잦은 선착순 시나리오에서 재시도가 눈덩이처럼 불어난다.
-- Redis 원자적 처리(Lua)는 재고 확인·차감·1인 1매 체크를 하나의 스크립트로 묶어, DB 락 경합 없이 순서를 보장한다.
-
-## `backend`의 핵심 설계 원칙
-
-`load-test`에서 검증한 건 "재고를 어떻게 원자적으로 깎는가"이고, 실제 서비스에는 그 결정이 안전하게 뚫리지 않도록 하는 방어선이 층층이 있다.
-
-- **1차 방어 (Redis)**: Lua 스크립트로 재고 확인·차감·1인 1매 체크를 원자적으로 처리
-- **최종 방어 (DB)**: `coupon_issue`에 `UNIQUE(coupon_id, member_id)` — Redis가 어떤 이유로든 뚫려도 DB가 물리적으로 중복 발급을 차단
-- **멱등성**: 상태 변경(사용/취소) API는 클라이언트가 생성한 멱등키를 저장해 재시도에 안전하게 대응
-- **정합성 검증**: 재고·발급 이력·Redis 상태를 사후 대조하는 배치를 별도로 두고, 실행 결과를 DB에 이력으로 남김 (`verification_run` → `verification_rule_result` → `verification_violation`)
+👉 [동시성 제어 6가지 비교 실험](https://github.com/MO-COU/load-test)
 
 ---
 
-## 기술 스택
+## 🔥 Core Features
 
-| 구분 | 선택 |
-|---|---|
-| 언어 | Java 21 |
-| 프레임워크 | Spring Boot 4.1.0-RC1 |
-| 빌드 | Gradle (Kotlin DSL) 9.0 |
-| DB | MySQL 8.0 |
-| 캐시/동시성 | Redis 8.8 (Lettuce) |
-| 배치 | Spring Batch 6.0.3 |
-| 마이그레이션 | Flyway |
-| 인프라 | Docker Compose, AWS EC2 (SSM 기반 배포) |
-| 테스트 | JUnit 5, Testcontainers, AssertJ |
-| 부하테스트 | k6 |
-| CI/CD | GitHub Actions |
+### Redis Lua 기반 원자적 발급
 
-## `backend` 프로젝트 구조
+Redis Lua Script에서 다음 작업을 하나의 원자적 연산으로 처리합니다.
 
-```
-src/main/java/com/mocou/
-├── global/          # 공통 (응답 포맷, 예외 처리, 요청 추적, 마스킹)
-├── member/          # 회원 도메인 (공통)
-├── coupon/          # 쿠폰/재고 마스터 도메인 (공통)
-├── issue/           # 발급·트래픽 제어 (A팀)
-├── lifecycle/       # 쿠폰 생명주기 (B팀)
-├── consistency/     # 정합성 검증 (B팀)
-├── admin/           # 관리자 대시보드 (C팀)
-├── notification/    # Mock 알림 (C팀)
-└── datagen/         # 더미데이터 생성 배치 (B팀)
-```
+- 쿠폰 발급 가능 시간 검증
+- 동일 회원 중복 발급 검증
+- 잔여 재고 확인 및 차감
+- 발급 회원 등록
+- 예약 순번 생성
+- Redis Stream 이벤트 생성
 
-패키지 소유권 규칙: `global`/`member`/`coupon`은 읽기 전용 공통 패키지이고, 다른 팀 패키지는 직접 import하지 않는다 — 데이터가 필요하면 공통 패키지를 참조하거나 상대 팀이 공개한 인터페이스(`NotificationSender` 등)를 통해서만 접근한다.
+이를 통해 별도의 분산 락 없이 동시 요청 간 재고 정합성을 유지합니다.
 
-## DB 스키마
-
-회원/쿠폰/발급/이력/알림/실패로그/검증 3종 — 총 10개 테이블. 상세는 [`backend/src/main/resources/db/migration`](https://github.com/MO-COU/backend/tree/main/src/main/resources/db/migration) 참고.
-
-## 시작하기
-
-각 저장소의 README 참고:
-- 서비스 실행: [`backend/README.md`](https://github.com/MO-COU/backend/blob/main/README.md)
-- 동시성 실험 재현: [`load-test/README.md`](https://github.com/MO-COU/load-test/blob/main/README.md)
 ---
-<details>
-<summary>멘토링 질문 (8월 18일)</summary>
 
-<p><b>Q1.</b><br>
-저희가 이해한 선착순 쿠폰 시나리오는 오픈 시각에 사용자가 한꺼번에 몰리는 상황입니다. 그런데 60초에 걸쳐 VU를 0에서 20,000까지 점진적으로 늘리면, 초반에는 동시 접속이 적어서 경합이 약하게 발생합니다. 재고가 램프업 도중에 소진되면 뒷구간은 전부 재고 소진 응답이 되고요. 부하 테스트 조건으로 "테스트 유저 20,000명, ramp-up 60초"를 받았는데, 램프업의 의도가 뭔지 궁금합니다.</p>
+### Redis Stream 기반 비동기 DB 저장
 
-<p><b>Q2.</b><br>
-저희 프로젝트에서는 테스트 결과를 근거로 기술 선택의 타당성을 보여주려고 합니다.
-예를 들어 Redis 도입 전후를 비교해서 동시성 처리나 성능 측면에서 Redis가 필요한지 검증할 수 있다고 생각합니다. 그런데 이런 식으로 접근하면 DB 종류(MySQL, PostgreSQL 등)나 서버 프레임워크(Spring, Node.js 등)까지 모두 비교 테스트를 해야 하는지 의문이 듭니다. 실무나 프로젝트에서 기술 선택을 검증하기 위한 테스트는 어느 수준까지 하는 게 적절한가요? 모든 기술 스택을 비교 검증하는 게 아니라면, 어떤 기술은 테스트로 검증하고 어떤 기술은 요구사항·팀 역량·생태계 등의 근거만으로 선택해도 되는지 그 기준이 궁금합니다.</p>
+Redis에서 발급 예약을 완료한 뒤, MySQL 저장은 Redis Stream Consumer가 비동기로 처리합니다.
 
-<p><b>Q2-1.</b><br>
-redis 방식이 훨씬 더 정합성과 성능이 뛰어난 것을 알고 있었지만 낙관적 락, 비관적 락, redisson-rlock 등을 테스트하여 가장 성능이 좋은 걸 확인하고 redis-lua 방식을 채택했습니다. 실무에서는 이런 방식이 어떤 의미를 가지는지, 유의미한 과정으로 남기려면 어떻게 해야할지 궁금합니다.</p>
+사용자 요청 경로에서 DB 저장을 분리해 DB 처리 시간이 API 응답시간에 직접 영향을 주는 것을 줄였습니다.
 
-<p><b>Q2-2.</b><br>
-저희는 비관적 락, 낙관적 락, DB 원자적 업데이트, Redisson RLock, Redis WATCH, Redis Lua를 비교해 대규모 동시 요청에서는 Redis Lua가 가장 높은 처리 성능을 보이는 것을 확인했습니다. 하지만 요청량과 경합이 적은 환경에서는 DB 원자적 업데이트만으로도 충분히 정합성을 보장할 수 있고, Redis를 추가하면 인프라 비용과 장애 지점, Redis–DB 동기화 문제가 늘어날 수 있다고 생각합니다. 따라서 Redis Lua가 항상 더 좋은 방식이라기보다, DB 락 대기와 커넥션 사용량이 일정 수준을 넘을 때 의미가 있는 선택이라고 이해했습니다. 실무에서는 다음 중 어떤 지표와 기준으로 DB 방식에서 Redis 방식으로 전환할 필요성을 판단하나요?</p>
+---
 
-<table>
-  <thead>
-    <tr><th>기준</th></tr>
-  </thead>
-  <tbody>
-    <tr><td>동시 요청 수와 초당 요청 수</td></tr>
-    <tr><td>DB 락 대기시간</td></tr>
-    <tr><td>DB 커넥션 풀 대기 수</td></tr>
-    <tr><td>p95 응답시간</td></tr>
-    <tr><td>오류·타임아웃 비율</td></tr>
-    <tr><td>DB CPU 사용률</td></tr>
-    <tr><td>Redis 도입·운영 비용</td></tr>
-  </tbody>
-</table>
+### PEL · Retry · DLQ 기반 장애 복구
 
-<p>또한 이번 실험을 단순히 가장 빠른 기술을 선정한 결과가 아니라, 각 방식이 처리할 수 있는 트래픽 범위와 Redis가 필요해지는 전환 지점을 찾는 과정으로 남기려면 어떤 조건으로 추가 측정하는 것이 적절한지 궁금합니다.</p>
+Consumer가 이벤트를 읽은 뒤 DB 처리에 실패한 경우 ACK되지 않은 이벤트는 Pending Entries List에 남습니다.
 
-<p><b>Q3.</b><br>
-Redis에서 재고 확정 후 Kafka로 비동기 DB 적재하는 구조에서, Consumer의 DB 적재가 실패하면 이미 유저에게 성공 응답이 나간 뒤라 Redis 보상이 무의미해지는데, 실무에서는 이런 상황을 보통 어떻게 처리하나요?</p>
+이후 재처리를 수행하고, 지속적으로 실패하는 이벤트는 DLQ로 분리하여 정상 이벤트 처리에 영향을 주지 않도록 구성했습니다.
 
-<p><b>Q4.</b><br>
-저희 프로젝트에서 Redis 확정 이후 DB 적재 과정의 정합성과 동시성 사이의 트레이드 오프 문제를 고민하다가, 다음과 같은 방향으로 정리했습니다. 이 판단이 맞는지 검증받고 싶습니다.</p>
-<ul>
-  <li>일반적인 DB 아웃박스 패턴 대신, Redis Streams를 활용하기로 했습니다. 재고 확정(Lua 스크립트) 안에서 <code>XADD</code>로 이벤트도 함께 기록하면, 재고 차감과 이벤트 발행이 같은 원자적 연산으로 묶여서, 별도 DB 테이블(outbox)이나 Kafka 발행처럼 "확정과 기록 사이에 틈"이 생기는 문제를 피할 수 있고 동시에 Redis의 빠른 처리 속도도 챙길 수 있다고 판단했습니다. Consumer가 이 스트림을 읽어 DB에 비동기로 적재하고, 처리 완료는 <code>XACK</code>로 추적합니다.</li>
-</ul>
+---
 
-<p><b>Q5.</b><br>
-기술 스택이나 성능 테스트가 비슷해질 수밖에 없는 상황에서, 기능·설계·검증 방식·운영 관점 중 어떤 부분을 차별화 포인트로 가져가는 게 좋을까요?</p>
+### Redis ↔ MySQL 정합성 검증
 
-</details>
-<details>	
-   <summary>멘토링 질문 (8월 25일)</summary>
+비동기 구조에서는 Redis 예약 상태와 MySQL 최종 상태 사이에 차이가 발생할 수 있기 때문에 별도의 정합성 검증 기능을 구현했습니다.
 
-<p><b>Q1.</b><br>
-부하 테스트 시나리오는 실무에서 어떤 방식으로 계획하나요? 시나리오를 설계할 때 어떤 요소들을 중점적으로 고려하는지도 궁금합니다.</p>
+주요 검증 항목은 다음과 같습니다.
 
-<p><b>Q2.</b><br>
-Flyway 마이그레이션에서 이미 적용된 파일을 수정하거나 버전 번호가 충돌하는 등의 문제가 발생할 수 있는데, 저희는 현재 사람이 직접 확인하면서 규칙을 지키고 있습니다. 실무에서는 이런 마이그레이션 규칙을 도구나 CI를 통해 강제하는 방법이 있나요?</p>
+- 초과 발급 여부
+- 동일 회원 중복 발급 여부
+- DB 발급 수와 잔여 재고 관계
+- Redis 예약 회원과 DB 발급 회원 비교
+- 쿠폰 상태와 상태 변경 이력 검증
+- Redis 예약 순번 및 발급 당시 잔여 재고 검증
 
+---
 
-<p><b>Q3.</b><br>
-현재는 단일 EC2에 애플리케이션, DB, Redis를 모두 구성하고 있습니다. 실제 운영 서비스로 확장한다면 가장 먼저 어떤 요소를 분리하는 것이 좋을까요? 예를 들어 DB 분리와 애플리케이션 이중화 중 어떤 것을 먼저 고려하는지 궁금합니다.</p>
+### Transactional Outbox 기반 알림 처리
 
-<p><b>Q4.</b><br>
-월 3만 원대 AI 서비스를 사용하면서 토큰이나 모델 사용량에 제약이 있지만, 그 안에서 최대한 효율적으로 활용할 수 있는 저만의 방법을 만들어 개발하면서 맞닥뜨리는 문제들을 해결하는 데 활용하고 있습니다. 이런 식으로 AI를 잘 활용하는 능력도 개발자로서 충분히 개인의 강점이 될 수 있을까요? 아니면 기본기에 더 집중하는 게 좋을까요?</p>
+쿠폰 발급이나 사용 처리와 알림 데이터를 동일한 DB Transaction 안에서 저장하고, 실제 알림 처리는 별도 Dispatcher에서 수행합니다.
 
-<p><b>Q5.</b><br>
-AI를 실무에서는 어떻게 활용하고 있나요? 실제 개발 과정에서 어느 정도 범위까지 AI를 활용하는지도 궁금합니다.</p>
+이를 통해 DB Commit 이후 서버 장애로 인해 알림 정보가 유실되는 문제를 줄였습니다.
 
-<p><b>Q6.</b><br>
-요즘 AI가 코드를 상당히 잘 작성해 주는데, 그럼에도 불구하고 AI가 대신하기 어렵다고 느끼시는 개발자의 핵심 역량은 무엇인가요?</p>
+---
 
-</details>
+### Coupon Lifecycle
+
+쿠폰은 발급 이후 다음 상태로 전이됩니다.
+
+```text
+ISSUED
+  ├──→ USED
+  └──→ EXPIRED
+````
+
+쿠폰 사용은 조건부 상태 변경을 통해 중복 사용을 방지하고, 만료 처리는 Spring Batch를 이용해 대량으로 처리합니다.
+
+---
+
+## 📊 Load Test
+
+MOCOU에서는 부하 테스트를 두 가지 목적으로 나누어 수행했습니다.
+
+### 1. 동시성 제어 전략 비교
+
+최종 시스템 개발 전, 동일한 조건에서 6가지 동시성 제어 방식을 비교했습니다.
+
+이 실험을 통해 Redis Lua 기반 구조를 최종 발급 방식으로 선정했습니다.
+
+👉 [MO-COU/load-test](https://github.com/MO-COU/load-test)
+
+---
+
+### 2. 최종 시스템 부하 검증
+
+최종 시스템에서는 k6를 이용해 여러 형태의 트래픽을 재현했습니다.
+
+* 20,000명 Ramp-up
+* 20,000 VU Spike
+* Ramp Once
+* Constant RPS
+* 동일 회원 반복 요청
+
+기본 쿠폰 재고는 **10,000장**을 기준으로 검증했습니다.
+
+### 주요 검증 기준
+
+```text
+발급 수 ≤ 총 재고
+
+회원별 발급 수 ≤ 1
+
+DB 발급 수 + DB 잔여 재고 = 총 재고
+
+Redis 발급 회원 = DB 발급 회원
+
+Redis Stream 미처리 Event = 0
+
+Consumer Pending = 0
+```
+
+상세 시나리오와 테스트 구현은 Backend 및 Load Test 저장소에서 확인할 수 있습니다.
+
+👉 [Backend Repository](https://github.com/MO-COU/backend)
+
+👉 [Load Test Repository](https://github.com/MO-COU/load-test)
+
+---
+
+## 🛠 Tech Stack
+
+### Backend
+
+![Java](https://img.shields.io/badge/Java-007396?style=flat\&logo=openjdk\&logoColor=white)
+![Spring Boot](https://img.shields.io/badge/Spring%20Boot-6DB33F?style=flat\&logo=springboot\&logoColor=white)
+![Spring Batch](https://img.shields.io/badge/Spring%20Batch-6DB33F?style=flat\&logo=spring\&logoColor=white)
+![Gradle](https://img.shields.io/badge/Gradle-02303A?style=flat\&logo=gradle\&logoColor=white)
+
+### Database & Messaging
+
+![MySQL](https://img.shields.io/badge/MySQL-4479A1?style=flat\&logo=mysql\&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-DC382D?style=flat\&logo=redis\&logoColor=white)
+![Flyway](https://img.shields.io/badge/Flyway-CC0200?style=flat\&logo=flyway\&logoColor=white)
+
+### Infrastructure
+
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat\&logo=docker\&logoColor=white)
+![AWS EC2](https://img.shields.io/badge/AWS%20EC2-FF9900?style=flat\&logo=amazonec2\&logoColor=white)
+![AWS S3](https://img.shields.io/badge/AWS%20S3-569A31?style=flat\&logo=amazons3\&logoColor=white)
+![AWS SSM](https://img.shields.io/badge/AWS%20SSM-232F3E?style=flat\&logo=amazonwebservices\&logoColor=white)
+![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-2088FF?style=flat\&logo=githubactions\&logoColor=white)
+
+### Test
+
+![JUnit5](https://img.shields.io/badge/JUnit%205-25A162?style=flat\&logo=junit5\&logoColor=white)
+![Testcontainers](https://img.shields.io/badge/Testcontainers-2496ED?style=flat\&logo=testcontainers\&logoColor=white)
+![k6](https://img.shields.io/badge/k6-7D64FF?style=flat\&logo=k6\&logoColor=white)
+
+---
+
+## 👥 Team
+
+| 이름  | 주요 담당                                                |
+| --- | ---------------------------------------------------- |
+| 권도하 | 공통 기능 및 배포·운영 환경                                     |
+| 권혁준 | 쿠폰 생명주기, 만료 Batch, Redis 발급 현황, 운영 로그 및 S3 백업        |
+| 박서희 | 관리자 API, k6 부하 테스트 및 AWS SSM 기반 실행                   |
+| 장근창 | 대용량 데이터 생성 및 Redis-DB 정합성 검증                         |
+| 조현빈 | Redis Stream Consumer, 재처리·DLQ, Transactional Outbox |
+| 지창민 | Redis Lua 기반 발급, 재고·중복 제어, 발급 순번 및 Redis 상태 관리       |
+
+---
+
+## 📚 Documents
+
+### Backend
+
+* [Backend README](https://github.com/MO-COU/backend)
+* [System Architecture](https://github.com/MO-COU/backend/blob/main/docs/architecture.md)
+* [Consistency Rules](https://github.com/MO-COU/backend/blob/main/docs/b1/consistency-rules.md)
+* [Coupon Lifecycle](https://github.com/MO-COU/backend/blob/main/docs/b2/coupon-lifecycle-policy.md)
+* [Expiration Batch](https://github.com/MO-COU/backend/blob/main/docs/b2/coupon-expiration-batch-guide.md)
+
+### Load Test
+
+* [Concurrency Strategy Comparison](https://github.com/MO-COU/load-test)
+* [Detailed Test Results](https://github.com/MO-COU/load-test/blob/main/docs/results.md)
+
+### Frontend
+
+* [Frontend Repository](https://github.com/MO-COU/frontend)
+
+---
+
+## MOCOU
+
+**선착순이라는 하나의 문제를 동시성 제어에서 끝내지 않고 비동기 처리, 데이터 정합성, 장애 복구, 부하 테스트와 운영까지 확장하여 검증한 프로젝트입니다.**
+
