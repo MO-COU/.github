@@ -132,7 +132,7 @@ Consumer가 이벤트를 읽은 뒤 DB 처리에 실패한 경우 ACK되지 않�
 ISSUED
   ├──→ USED
   └──→ EXPIRED
-````
+```
 
 쿠폰 사용은 조건부 상태 변경을 통해 중복 사용을 방지하고, 만료 처리는 Spring Batch를 이용해 대량으로 처리합니다.
 
@@ -148,6 +148,8 @@ MOCOU에서는 부하 테스트를 두 가지 목적으로 나누어 수행했�
 
 이 실험을 통해 Redis Lua 기반 구조를 최종 발급 방식으로 선정했습니다.
 
+회원 20,000명이 재고 10,000장에 동시에 몰리는 조건에서 Redis Lua만 실패율 0%로 8.4-11.5초 안에 재고를 모두 발급했습니다. 재고를 DB에서 판정한 방식은 60초 타임아웃에 걸리며 실패율이 53-76%였습니다.
+
 👉 [MO-COU/load-test](https://github.com/MO-COU/load-test)
 
 ---
@@ -157,7 +159,7 @@ MOCOU에서는 부하 테스트를 두 가지 목적으로 나누어 수행했�
 최종 시스템에서는 k6를 이용해 여러 형태의 트래픽을 재현했습니다.
 
 * 20,000명 Ramp-up
-* 20,000 VU Spike
+* 20,000·50,000 VU Spike
 * Ramp Once
 * Constant RPS
 * 동일 회원 반복 요청
@@ -167,18 +169,16 @@ MOCOU에서는 부하 테스트를 두 가지 목적으로 나누어 수행했�
 ### 주요 검증 기준
 
 ```text
-발급 수 ≤ 총 재고
+쿠폰별 회원 발급 수 ≤ 1
 
-회원별 발급 수 ≤ 1
+발급 수 ≤ 총 재고
 
 DB 발급 수 + DB 잔여 재고 = 총 재고
 
-Redis 발급 회원 = DB 발급 회원
-
-Redis Stream 미처리 Event = 0
-
-Consumer Pending = 0
+Redis 발급 회원 = DB 발급 회원, Redis 재고 = DB 잔여 재고
 ```
+
+이 밖에 상태·시각 모순, 상태 이력 체인, 참조 무결성, 예약 순번을 검사합니다. Redis Stream 미처리 이벤트·Consumer Pending·DLQ가 남아 있으면 판정하지 않고 `ERROR`로 기록합니다.
 
 상세 시나리오와 테스트 구현은 Backend 및 Load Test 저장소에서 확인할 수 있습니다.
 
@@ -226,7 +226,7 @@ Consumer Pending = 0
 | 권도하 | 공통 기능 및 배포·운영 환경                                     |
 | 권혁준 | 쿠폰 생명주기, 만료 Batch, Redis 발급 현황, 운영 로그 및 S3 백업        |
 | 박서희 | 관리자 API, k6 부하 테스트 및 AWS SSM 기반 실행                   |
-| 장근창 | 대용량 데이터 생성 및 Redis-DB 정합성 검증                         |
+| 장근창 (팀장) | 대용량 데이터 생성, Redis-DB 정합성 검증과 검증 쿼리 튜닝, 동시성 제어 비교 실험 설계·측정 |
 | 조현빈 | Redis Stream Consumer, 재처리·DLQ, Transactional Outbox |
 | 지창민 | Redis Lua 기반 발급, 재고·중복 제어, 발급 순번 및 Redis 상태 관리       |
 
